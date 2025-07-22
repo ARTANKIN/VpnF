@@ -25,7 +25,7 @@ class VpnClientService : VpnService() {
 
     companion object {
         private const val TAG = "VpnClientService"
-        var SERVER_ADDRESS = "172.20.10.2"
+        var SERVER_ADDRESS = "172.25.15.2"
         private const val SERVER_PORT = 5555
         const val ACTION_VPN_STOPPED = "com.example.vpnvkr.VPN_STOPPED"
         const val ACTION_VPN_TRAFFIC_STATS = "com.example.vpnvkr.VPN_TRAFFIC_STATS"
