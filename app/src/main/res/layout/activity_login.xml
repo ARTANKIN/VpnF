@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <EditText
+        android:id="@+id/etUsername"
+        style="@style/AppEditTextStyle"
+        android:hint="Имя пользователя" />
+
+    <EditText
+        android:id="@+id/etPassword"
+        style="@style/AppEditTextStyle"
+        android:hint="Пароль"
+        android:inputType="textPassword" />
+
+    <Button
+        android:id="@+id/btnLogin"
+        style="@style/AppButtonStyle"
+        android:text="Войти" />
+
+    <Button
+        android:id="@+id/btnBack"
+        style="@style/AppButtonStyle"
+        android:text="Назад"
+        android:textColor="@color/colorPrimaryDark"
+        android:background="@android:color/transparent" />
+</LinearLayout>

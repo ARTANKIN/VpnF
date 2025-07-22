@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="16dp"
+        android:text="Выберите сервер"
+        android:textSize="24sp" />
+
+    <Button
+        android:id="@+id/btnServer1"
+        style="@style/AppButtonStyle"
+        android:text="Россия" />
+
+    <Button
+        android:id="@+id/btnServer2"
+        style="@style/AppButtonStyle"
+        android:text="Кения" />
+
+    <Button
+        android:id="@+id/btnServer3"
+        style="@style/AppButtonStyle"
+        android:text="Казахстан" />
+
+    <Button
+        android:id="@+id/btnBack"
+        style="@style/AppButtonStyle"
+        android:text="Назад"
+        android:textColor="@color/colorPrimaryDark"
+        android:background="@android:color/transparent" />
+
+</LinearLayout>
+
+
+
+

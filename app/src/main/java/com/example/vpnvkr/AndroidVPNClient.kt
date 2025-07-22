@@ -1,241 +1,289 @@
 package com.example.vpnvkr
 
+import android.app.Service
 import android.content.Intent
 import android.net.VpnService
+import android.net.VpnService.Builder
+import android.os.Binder
+import android.os.IBinder
 import android.os.ParcelFileDescriptor
-import android.system.OsConstants
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import org.json.JSONObject
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.SocketTimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 
 class VpnClientService : VpnService() {
-    private var vpnInterface: ParcelFileDescriptor? = null
-    private var socket: DatagramSocket? = null
-    private val cryptoManager by lazy { CryptoManager() }
-    private val coroutineScope = CoroutineScope(Dispatchers.IO + Job())
-    private val tokenManager by lazy { TokenManager(this) }
-    private var isRunning = true
 
     companion object {
-//        private const val SERVER_ADDRESS = "95.181.174.237"
-//        private const val SERVER_ADDRESS = "172.20.10.2"
-private const val SERVER_ADDRESS = "87.228.77.67"
+        private const val TAG = "VpnClientService"
+        var SERVER_ADDRESS = "172.20.10.2"
         private const val SERVER_PORT = 5555
-        private const val TAG = "VPNClientService"
         const val ACTION_VPN_STOPPED = "com.example.vpnvkr.VPN_STOPPED"
+        const val ACTION_VPN_TRAFFIC_STATS = "com.example.vpnvkr.VPN_TRAFFIC_STATS"
+    }
+
+    // Управление состоянием сервиса
+    private val isRunning = AtomicBoolean(false)
+    private val isStopping = AtomicBoolean(false)
+
+    // Корутины и каналы
+    private val serviceScope = CoroutineScope(
+        Dispatchers.IO +
+                SupervisorJob() +
+                CoroutineExceptionHandler { _, throwable ->
+                    Log.e(TAG, "Coroutine error", throwable)
+                }
+    )
+    private val packetChannel = Channel<ByteArray>(Channel.BUFFERED)
+
+    // Ресурсы VPN
+    private var vpnInterface: ParcelFileDescriptor? = null
+    private var socket: DatagramSocket? = null
+
+    // Менеджеры
+    private val cryptoManager by lazy { CryptoManager() }
+    private val tokenManager by lazy { TokenManager(this) }
+
+    // Статистика трафика
+    private val sentBytesTotal = AtomicLong(0)
+    private val receivedBytesTotal = AtomicLong(0)
+
+    override fun onCreate() {
+        super.onCreate()
+        Log.d(TAG, "VPN Service created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d(TAG, "VPN Service starting...")
-        setupVpnConnection()
-        return START_NOT_STICKY // Используем NOT_STICKY, чтобы сервис не перезапускался
-    }
-
-    private fun setupVpnConnection() {
-        try {
-            val builder = Builder()
-                .setSession("MyVPNClient")
-                .addAddress("10.0.0.2", 24)
-                .addRoute("0.0.0.0", 0)
-                .addDnsServer("8.8.8.8")
-                .addDnsServer("1.1.1.1")
-                .setMtu(1200)
-
-            vpnInterface = builder.establish()
-            Log.d(TAG, "VPN interface established")
-
-            socket = DatagramSocket().apply {
-                protect(this)
+        when (intent?.action) {
+            "STOP_VPN" -> {
+                stopVpnService()
+                return START_NOT_STICKY
             }
-            Log.d(TAG, "UDP socket created and protected")
-
-            coroutineScope.launch(Dispatchers.IO) {
-                sendInitialPacket()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Setup VPN connection failed", e)
-            stopSelf()
-        }
-    }
-
-    private suspend fun sendInitialPacket() {
-        try {
-            val token = tokenManager.getToken()
-            if (token == null) {
-                Log.e(TAG, "No token available")
-                withContext(Dispatchers.Main) {
-                    stopSelf()
+            else -> {
+                if (isRunning.get()) {
+                    Log.d(TAG, "VPN Service already running")
+                    return START_NOT_STICKY
                 }
-                return
-            }
+                isRunning.set(true)
+                isStopping.set(false)
 
-            val authPacket = JSONObject().apply {
-                put("type", "auth")
-                put("token", token)
-            }.toString()
-
-            Log.d(TAG, "Sending auth packet content: $authPacket")
-            val serverAddress = InetAddress.getByName(SERVER_ADDRESS)
-            val packet = DatagramPacket(
-                authPacket.toByteArray(Charsets.UTF_8),
-                authPacket.length,
-                serverAddress,
-                SERVER_PORT
-            )
-
-            socket?.send(packet)
-            Log.d(TAG, "Initial auth packet sent")
-
-            receiveAuthResponse()
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to send initial packet", e)
-            withContext(Dispatchers.Main) {
-                stopSelf()
+                serviceScope.launch {
+                    try {
+                        setupVpnConnection()
+                        startPacketProcessing()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "VPN setup failed", e)
+                        stopVpnService()
+                    }
+                }
+                return START_STICKY
             }
         }
     }
 
-    private suspend fun receiveAuthResponse() {
-        val receiveBuffer = ByteArray(1024)
-        val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
+    private suspend fun setupVpnConnection() = withContext(Dispatchers.IO) {
+        val token = tokenManager.getToken() ?: throw IllegalStateException("No token available")
+
+        // Настройка VPN
+        val builder = Builder()
+            .setSession("MyVPNClient")
+            .addAddress("10.0.0.2", 24)
+            .addRoute("0.0.0.0", 0)
+            .addDnsServer("8.8.8.8")
+            .addDnsServer("1.1.1.1")
+            .setMtu(1500)
+
+        vpnInterface = builder.establish()
+
+        // Создание и защита сокета
+        socket = DatagramSocket().apply {
+            protect(this)
+            soTimeout = 1000
+        }
+
+        // Отправка начального пакета аутентификации
+        sendAuthPacket(token)
+    }
+
+    private suspend fun sendAuthPacket(token: String) {
+        val authPacket = JSONObject().apply {
+            put("type", "auth")
+            put("token", token)
+        }.toString()
+
+        val serverAddress = InetAddress.getByName(SERVER_ADDRESS)
+        val packet = DatagramPacket(
+            authPacket.toByteArray(Charsets.UTF_8),
+            authPacket.length,
+            serverAddress,
+            SERVER_PORT
+        )
+
+        socket?.send(packet)
+        Log.d(TAG, "Auth packet sent")
+    }
+
+    private suspend fun startPacketProcessing() {
+        val sendJob = serviceScope.launch { sendPackets() }
+        val receiveJob = serviceScope.launch { receivePackets() }
+        val statsJob = serviceScope.launch { broadcastTrafficStats() }
+
+        // Ожидание завершения всех задач
+        listOf(sendJob, receiveJob, statsJob).joinAll()
+    }
+
+    private suspend fun sendPackets() {
+        val inputStream = FileInputStream(vpnInterface?.fileDescriptor)
+        val buffer = ByteArray(32767)
 
         try {
-            socket?.soTimeout = 10000
-            Log.d(TAG, "Waiting for auth response from server...")
-            socket?.receive(packet)
-            val response = String(packet.data, 0, packet.length, Charsets.UTF_8)
-            Log.d(TAG, "Received auth response: $response")
-            val jsonResponse = JSONObject(response)
-            if (jsonResponse.getString("type") == "auth_response" &&
-                jsonResponse.getString("token") == "success"
-            ) {
-                Log.d(TAG, "Authentication successful")
-                handlePackets()
-            } else {
-                Log.e(TAG, "Authentication failed: $response")
-                withContext(Dispatchers.Main) {
-                    stopSelf()
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error receiving auth response", e)
-            withContext(Dispatchers.Main) {
-                stopSelf()
-            }
-        }
-    }
-
-    private suspend fun handlePackets() {
-        val receiveBuffer = ByteArray(32767)
-        val sendBuffer = ByteArray(32767)
-
-        coroutineScope.launch(Dispatchers.IO) {
-            while (isRunning) {
-                try {
-                    val inputStream = FileInputStream(vpnInterface?.fileDescriptor)
-                    val length = inputStream.read(sendBuffer)
+            while (isRunning.get() && !isStopping.get()) {
+                withContext(Dispatchers.IO) {
+                    val length = inputStream.read(buffer)
                     if (length > 0) {
-                        val encryptedData = cryptoManager.encrypt(sendBuffer.copyOfRange(0, length))
+                        val encryptedData = cryptoManager.encrypt(buffer.copyOfRange(0, length))
                         val packet = DatagramPacket(
                             encryptedData,
                             encryptedData.size,
                             InetAddress.getByName(SERVER_ADDRESS),
                             SERVER_PORT
                         )
-                        socket?.send(packet)
-                        Log.d(TAG, "Sent packet to server, size: ${encryptedData.size}, original size: $length")
+                        socket?.let { if (!it.isClosed) it.send(packet) }
+                        sentBytesTotal.addAndGet(encryptedData.size.toLong())
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error sending packet", e)
-                    if (!isRunning) break
                 }
             }
-            Log.d(TAG, "Send loop stopped")
+        } catch (e: Exception) {
+            if (isRunning.get() && !isStopping.get()) {
+                Log.e(TAG, "Send packet error", e)
+            }
+        } finally {
+            try {
+                inputStream.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error closing input stream", e)
+            }
         }
+        Log.d(TAG, "Send packets loop stopped")
+    }
 
-        coroutineScope.launch(Dispatchers.IO) {
-            while (isRunning) {
-                try {
-                    val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
-                    socket?.receive(packet)
-                    Log.d(TAG, "Received packet from server, size: ${packet.length}")
+    private suspend fun receivePackets() {
+        val outputStream = FileOutputStream(vpnInterface?.fileDescriptor)
+        val buffer = ByteArray(32767)
 
-                    val decryptedData = cryptoManager.decrypt(
-                        receiveBuffer.copyOfRange(0, packet.length)
-                    )
+        while (isRunning.get() && !isStopping.get()) {
+            try {
+                val packet = DatagramPacket(buffer, buffer.size)
+                socket?.receive(packet)
 
-                    Log.d(TAG, "Decrypted packet size: ${decryptedData.size}")
-
-                    val outputStream = FileOutputStream(vpnInterface?.fileDescriptor)
-                    outputStream.write(decryptedData)
-                    Log.d(TAG, "Wrote decrypted packet to VPN interface")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error receiving packet", e)
-                    if (!isRunning) break
+                val decryptedData = cryptoManager.decrypt(
+                    buffer.copyOfRange(0, packet.length)
+                )
+                outputStream.write(decryptedData)
+                receivedBytesTotal.addAndGet(packet.length.toLong())
+            } catch (e: Exception) {
+                if (!isRunning.get()) break
+                if (e !is SocketTimeoutException) {
+                    Log.e(TAG, "Receive packet error", e)
                 }
             }
-            Log.d(TAG, "Receive loop stopped")
         }
+        Log.d(TAG, "Receive packets loop stopped")
+    }
+
+    private suspend fun broadcastTrafficStats() {
+        while (isRunning.get() && !isStopping.get()) {
+            try {
+                if (!isStopping.get()) {
+                    val intent = Intent(ACTION_VPN_TRAFFIC_STATS).apply {
+                        putExtra("sentBytes", sentBytesTotal.get())
+                        putExtra("receivedBytes", receivedBytesTotal.get())
+                    }
+                    Log.d(TAG, "Broadcasting traffic stats: Sent=${sentBytesTotal.get()}, Received=${receivedBytesTotal.get()}")
+                    LocalBroadcastManager.getInstance(this@VpnClientService).sendBroadcast(intent)
+                }
+                delay(1000)
+            } catch (e: Exception) {
+                if (!isStopping.get()) {
+                    Log.e(TAG, "Traffic stats broadcast error", e)
+                }
+            }
+        }
+    }
+
+    // Make stopVpnService public
+    fun stopVpnService() {
+        if (isStopping.getAndSet(true)) return
+
+        Log.d(TAG, "Stopping VPN service")
+        isRunning.set(false)
+
+        serviceScope.coroutineContext.cancelChildren()
+
+        // Close and nullify the VPN interface
+        vpnInterface?.let {
+            try {
+                it.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "VPN interface close error", e)
+            } finally {
+                vpnInterface = null
+            }
+        }
+
+        // Close the socket
+        socket?.let {
+            try {
+                it.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Socket close error", e)
+            } finally {
+                socket = null
+            }
+        }
+
+        // Reset traffic statistics
+        sentBytesTotal.set(0)
+        receivedBytesTotal.set(0)
+
+        sendBroadcast(Intent(ACTION_VPN_STOPPED))
+        stopSelf()
     }
 
     override fun onDestroy() {
-        Log.d(TAG, "VPN Service destroying...")
-        isRunning = false
-        // Отменяем корутины и ждем их завершения
-        runBlocking {
-            coroutineScope.cancel("Service is stopping")
-            Log.d(TAG, "Coroutines cancelled")
-        }
-        try {
-            vpnInterface?.close()
-            Log.d(TAG, "VPN interface closed")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing VPN interface", e)
-        }
-        try {
-            socket?.close()
-            Log.d(TAG, "UDP socket closed")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing socket", e)
-        }
-        // Отправляем broadcast о том, что сервис остановлен
-        val intent = Intent(ACTION_VPN_STOPPED)
-        sendBroadcast(intent)
-        Log.d(TAG, "Broadcast sent: VPN stopped")
-        super.onDestroy()
         Log.d(TAG, "VPN Service destroyed")
+        stopVpnService()
+        super.onDestroy()
     }
 
     override fun onRevoke() {
-        Log.d(TAG, "VPN Service revoked by system")
-        isRunning = false
-        runBlocking {
-            coroutineScope.cancel("Service revoked by system")
-            Log.d(TAG, "Coroutines cancelled due to revoke")
-        }
-        try {
-            vpnInterface?.close()
-            Log.d(TAG, "VPN interface closed on revoke")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing VPN interface on revoke", e)
-        }
-        try {
-            socket?.close()
-            Log.d(TAG, "UDP socket closed on revoke")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing socket on revoke", e)
-        }
-        // Отправляем broadcast о том, что сервис остановлен
-        val intent = Intent(ACTION_VPN_STOPPED)
-        sendBroadcast(intent)
-        Log.d(TAG, "Broadcast sent: VPN stopped due to revoke")
-        stopSelf()
+        Log.d(TAG, "VPN Service revoked")
+        stopVpnService()
         super.onRevoke()
-        Log.d(TAG, "VPN Service revoked completed")
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.d(TAG, "VPN Service task removed")
+        stopVpnService()
+        super.onTaskRemoved(rootIntent)
+    }
+
+    inner class LocalBinder : Binder() {
+        fun getService(): VpnClientService = this@VpnClientService
+    }
+
+    private val binder = LocalBinder()
+
+    override fun onBind(intent: Intent?): IBinder {
+        return binder
     }
 }

@@ -11,9 +11,8 @@ import java.io.IOException
 class ApiService {
     private val client = OkHttpClient()
 
-    private val baseUrl = "http://87.228.77.67:8080"
-//    private val baseUrl = "http://95.181.174.237:8080"
-//    private val baseUrl = "http://10.0.2.2:8080"
+        private val baseUrl = "http://10.0.2.2:8080"
+
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
     suspend fun login(credentials: UserCredentials): LoginResponse = withContext(Dispatchers.IO) {
